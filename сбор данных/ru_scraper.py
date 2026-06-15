@@ -6,12 +6,7 @@
 import sqlite3
 import time
 import logging
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException
+import cloudscraper
 from bs4 import BeautifulSoup
 
 # Настройка логирования: уровень INFO, формат с меткой времени
@@ -82,33 +77,26 @@ def insert_questions_batch(conn, questions):
     except sqlite3.Error as e:
         logging.error(f"Ошибка пакетной вставки: {e}")
 
-def get_page_content(driver, url, retries=3):
+def get_page_content(scraper, url, retries=3):
     """
-    Открывает указанный URL в браузере и ожидает загрузки карточек вопросов.
+    Загружает страницу через cloudscraper и возвращает HTML.
     При неудаче повторяет попытку до retries раз с задержкой 3 секунды.
-    :param driver: экземпляр Selenium WebDriver
+    :param scraper: экземпляр cloudscraper
     :param url: адрес страницы для загрузки
     :param retries: максимальное число попыток (по умолчанию 3)
     :return: HTML-исходник страницы (str) или None при неудаче
     """
     for attempt in range(1, retries + 1):
         try:
-            driver.get(url)
-            # Ожидаем появления хотя бы одной карточки вопроса
-            WebDriverWait(driver, 8).until(
-                EC.presence_of_element_located(
-                    (By.CLASS_NAME, "s-post-summary")
-                )
-            )
-            return driver.page_source
-        except TimeoutException:
+            resp = scraper.get(url, timeout=20)
+            if resp.status_code == 200:
+                return resp.text
             logging.warning(
-                f"Таймаут на странице {url} (попытка {attempt}/{retries})"
+                f"HTTP {resp.status_code} на {url} (попытка {attempt}/{retries})"
             )
-            time.sleep(3)
         except Exception as e:
-            logging.error(f"Ошибка загрузки страницы {url}: {e}")
-            time.sleep(3)
+            logging.error(f"Ошибка загрузки {url}: {e}")
+        time.sleep(3)
     return None
 
 def _parse_stat_number(text):
@@ -119,13 +107,21 @@ def _parse_stat_number(text):
     :param text: строка метрики, например '1.2k', '1k', '123 раз', '42'
     :return: целое число или 0
     """
-    t = text.replace('\u00a0', ' ').replace(' раз', '').replace('-', '').strip().lower()
+    t = text.replace('\u00a0', ' ').replace(' раз', '').strip().lower()
+    negative = False
+    if t.startswith('-'):
+        negative = True
+        t = t[1:]
     if 'k' in t:
         try:
-            return int(float(t.replace('k', '')) * 1000)
+            result = int(float(t.replace('k', '')) * 1000)
+            return -result if negative else result
         except ValueError:
             return 0
-    return int(t) if t.isdigit() else 0
+    if t.lstrip('-').isdigit():
+        result = int(t)
+        return -result if negative else result
+    return 0
 
 def parse_questions(html):
     """
@@ -176,11 +172,11 @@ def parse_questions(html):
             for stat in stats:
                 stitle = (stat.get('title') or '').lower()
                 num = get_num(stat)
-                if any(kw in stitle for kw in ('голос', 'vote', 'score')):
+                if any(kw in stitle for kw in ('голос', 'оценк', 'vote', 'score')):
                     votes = num; matched = True
                 elif any(kw in stitle for kw in ('ответ', 'answer')):
                     answers = num; matched = True
-                elif any(kw in stitle for kw in ('просмотр', 'view')):
+                elif any(kw in stitle for kw in ('просмотр', 'показ', 'view')):
                     views = num; matched = True
 
             # Fallback: если title не распознан — по позиции (голоса→ответы→просмотры)
@@ -212,25 +208,14 @@ def main(db_file, base_url, num_pages, delay=1.5):
         return
     create_table(conn)
 
-    # Настройка браузера Chrome в режиме headless
-    opts = Options()
-    for arg in [
-        "--incognito",
-        "--disable-extensions",
-        "--blink-settings=imagesEnabled=false",  # отключение изображений — экономия трафика
-        "--headless=new",
-        "--no-sandbox",
-        "--disable-dev-shm-usage",
-    ]:
-        opts.add_argument(arg)
-
-    driver = webdriver.Chrome(options=opts)
+    # Инициализация cloudscraper (обходит Cloudflare автоматически)
+    scraper = cloudscraper.create_scraper()
     try:
         for page in range(1, num_pages + 1):
             sep = '&' if '?' in base_url else '?'
             url = f"{base_url}{sep}page={page}"
             logging.info(f"Обрабатывается страница {page}/{num_pages}: {url}")
-            html = get_page_content(driver, url)
+            html = get_page_content(scraper, url)
             if html:
                 parsed = parse_questions(html)
                 if parsed:
@@ -242,8 +227,7 @@ def main(db_file, base_url, num_pages, delay=1.5):
             # Задержка между запросами для соблюдения этических норм сбора
             time.sleep(delay)
     finally:
-        # Гарантированное закрытие браузера и соединения с БД
-        driver.quit()
+        # Закрытие соединения с БД
         conn.close()
         logging.info("Скрапер завершил работу")
 
